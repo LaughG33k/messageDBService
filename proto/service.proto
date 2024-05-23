@@ -1,0 +1,52 @@
+syntax = "proto3";
+
+package auth;
+
+option go_package="/codegen";
+
+service MessageDBworkerService {
+
+    rpc Operation(stream Request) returns (stream Response);
+
+}
+
+message Request {
+    uint32 operation_id = 1;
+    optional string user_uuid = 2;
+    optional Message message = 3;
+    optional DelMessage delMessage = 4;
+  
+}
+
+
+message Message {
+    string id = 1;
+    string text = 2;
+    string sender = 3;
+    string recipient = 4;
+    int64 time = 5;
+    
+}
+
+message DelMessage {
+    string sender = 1;
+    string recipient = 2;
+    string id = 3;
+    bool for_everyone= 4;
+}
+
+message EditMessage {
+    string sender = 1;
+    string recipient = 2;
+    string id = 3;
+    string new_text = 4;
+    
+}
+
+message Response {
+    uint32 status = 1;
+    string message = 2;
+}
+
+
+
