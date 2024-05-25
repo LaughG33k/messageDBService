@@ -5,9 +5,9 @@ import (
 	"errors"
 	"time"
 
-	"github.com/LaughG33k/messageDBService/iternal/client/mongo"
 	"github.com/LaughG33k/messageDBService/iternal/codegen"
 	"github.com/LaughG33k/messageDBService/iternal/model"
+	chatrepository "github.com/LaughG33k/messageDBService/iternal/repository/mongo/chatRepository"
 	"github.com/LaughG33k/messageDBService/pkg"
 )
 
@@ -15,14 +15,15 @@ type Handler struct {
 	codegen.MessageDBworkerServiceServer
 	OperationTimeout     time.Duration
 	ctx                  context.Context
-	mongoClient          *mongo.MongoClient
+	repository           *chatrepository.ChatRepository
 	reqBufferSizePerConn int
 }
 
-func initSaveMessagesHandler(mongoClient *mongo.MongoClient, reqBufferSizePerConn int) codegen.MessageDBworkerServiceServer {
+func InitSaveMessagesHandler(repository *chatrepository.ChatRepository, reqBufferSizePerConn int) codegen.MessageDBworkerServiceServer {
 	return &Handler{
 		ctx:                  context.Background(),
 		reqBufferSizePerConn: reqBufferSizePerConn,
+		repository:           repository,
 	}
 }
 
@@ -97,7 +98,7 @@ func (h *Handler) saveMessage(req *codegen.Request) error {
 	tm, canc := context.WithTimeout(h.ctx, h.OperationTimeout)
 	defer canc()
 
-	if err := h.mongoClient.SaveMessage(tm, msg); err != nil {
+	if err := h.repository.SaveMessage(tm, msg); err != nil {
 		return err
 	}
 
@@ -121,13 +122,13 @@ func (h *Handler) deleteMessage(req *codegen.Request) error {
 
 	if req.DelMessage.ForEveryone {
 
-		if err := h.mongoClient.DelSentMsgForEvryone(tm, msg); err != nil {
+		if err := h.repository.DelSentMsgForEvryone(tm, msg); err != nil {
 			return err
 		}
 		return nil
 	}
 
-	if err := h.mongoClient.DelSentMsg(tm, msg); err != nil {
+	if err := h.repository.DelSentMsg(tm, msg); err != nil {
 		return err
 	}
 
