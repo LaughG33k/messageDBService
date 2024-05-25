@@ -6,9 +6,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/LaughG33k/messageDBService/iternal/model"
-
-	"go.mongodb.org/mongo-driver/bson"
+	"github.com/LaughG33k/messageDBService/pkg"
 	"go.mongodb.org/mongo-driver/mongo"
 	"go.mongodb.org/mongo-driver/mongo/options"
 	"go.mongodb.org/mongo-driver/mongo/readpref"
@@ -18,13 +16,12 @@ import (
 type MongoClient struct {
 	ctx context.Context
 
-	conn       *mongo.Client
-	db         *mongo.Database
-	collection *mongo.Collection
+	conn *mongo.Client
+	db   *mongo.Database
 
-	muBulkData *sync.Mutex
+	collections    map[string]*mongo.Collection
+	lockCollection *sync.RWMutex
 
-	stopClient  bool
 	closeClient bool
 
 	cfg MongoClientConfig
@@ -33,10 +30,10 @@ type MongoClient struct {
 }
 
 type MongoClientConfig struct {
-	Host       string
-	Port       string
-	Db         string
-	Collection string
+	Host        string
+	Port        string
+	Db          string
+	Collections []string
 
 	BulkWriteTimeSleep     time.Duration
 	HealthCheakWaitingTime time.Duration
@@ -77,14 +74,19 @@ func NewMongoClient(ctx context.Context, config MongoClientConfig) (*MongoClient
 		options.Database().SetWriteConcern(writeconcern.Majority()),
 	)
 
+	colls := make(map[string]*mongo.Collection, len(config.Collections))
+
+	for _, v := range config.Collections {
+		colls[v] = db.Collection(v)
+	}
+
 	mc := &MongoClient{
 		ctx:             ctx,
 		conn:            conn,
 		db:              db,
-		collection:      db.Collection(config.Collection),
-		muBulkData:      &sync.Mutex{},
+		collections:     colls,
+		lockCollection:  &sync.RWMutex{},
 		onceInitDistrib: &sync.Once{},
-		stopClient:      false,
 		closeClient:     false,
 		cfg:             config,
 	}
@@ -93,36 +95,27 @@ func NewMongoClient(ctx context.Context, config MongoClientConfig) (*MongoClient
 
 }
 
-func (c *MongoClient) healthCheck() {
+func (c *MongoClient) HealthCheck() {
 
 	for {
-
-		if c.closeClient {
-			return
-		}
-
-		if c.stopClient {
-			continue
-		}
 
 		time.Sleep(c.cfg.HealthCheakWaitingTime)
 
 		if err := c.conn.Ping(c.ctx, readpref.Primary()); err != nil {
-			c.stopClient = true
 			fmt.Println(err)
-			go c.recconect()
+			if err := c.recconect(); err != nil {
+				fmt.Println(err)
+				return
+			}
 		}
 
 	}
 
 }
 
-func (c *MongoClient) recconect() {
+func (c *MongoClient) recconect() error {
 
-	attempts := c.cfg.RecconectAttempts
-
-	for attempts > 0 {
-
+	err := pkg.RetrySmth(func() error {
 		conn, err := mongo.Connect(
 			c.ctx,
 			options.Client().ApplyURI(fmt.Sprintf("mongodb://%s:%s/", c.cfg.Host, c.cfg.Port)),
@@ -134,9 +127,7 @@ func (c *MongoClient) recconect() {
 		)
 
 		if err != nil {
-			attempts--
-			time.Sleep(c.cfg.ReconectWaitingTime)
-			continue
+			return err
 		}
 
 		c.conn = conn
@@ -146,131 +137,45 @@ func (c *MongoClient) recconect() {
 			options.Database().SetWriteConcern(writeconcern.Majority()),
 		)
 
-		c.stopClient = false
+		c.reInitCollections()
 
-		return
+		return nil
+	}, c.cfg.RecconectAttempts, c.cfg.ReconectWaitingTime)
 
+	if err != nil {
+		if err := c.conn.Disconnect(c.ctx); err != nil {
+			return err
+		}
+
+		c.closeClient = true
+		return err
 	}
 
-	if err := c.conn.Disconnect(c.ctx); err != nil {
-		fmt.Println(err)
-	}
+	return nil
+}
 
-	c.closeClient = true
+func (c *MongoClient) reInitCollections() {
+
+	c.lockCollection.Lock()
+	defer c.lockCollection.Unlock()
+
+	for _, v := range c.cfg.Collections {
+
+		c.collections[v] = c.db.Collection(v)
+
+	}
 
 }
 
-func (c *MongoClient) SaveMessage(ctx context.Context, data model.MessageForSave) error {
+func (c *MongoClient) Collection(name string) *mongo.Collection {
 
 	if c.closeClient {
-		return fmt.Errorf("conn closed")
+		return nil
 	}
 
-	if c.stopClient {
-		return fmt.Errorf("stopped")
-	}
+	c.lockCollection.RLock()
+	defer c.lockCollection.RUnlock()
 
-	updateAtRecipient := mongo.NewUpdateOneModel()
-	updateAtRecipient.
-		SetFilter(bson.M{"uuid": data.ReceiverUuid}).
-		SetUpdate(bson.M{"$set": bson.M{fmt.Sprintf("received.%s.%s", data.SenderUuid, data.MessageId): bson.M{"text": data.Text, "time": data.Time, "editFlag": false}}})
-
-	updateAtSender := mongo.NewUpdateOneModel()
-
-	updateAtSender.
-		SetFilter(bson.M{"uuid": data.SenderUuid}).
-		SetUpdate(bson.M{"$set": bson.M{fmt.Sprintf("sent.%s.%s", data.ReceiverUuid, data.MessageId): bson.M{"text": data.Text, "time": data.Time, "editFlag": false}}})
-
-	if _, err := c.collection.BulkWrite(ctx, []mongo.WriteModel{updateAtRecipient, updateAtSender}); err != nil {
-		return err
-	}
-
-	return nil
-
-}
-
-func (c *MongoClient) DelSentMsg(ctx context.Context, msg model.MessageForDelete) error {
-
-	if c.closeClient {
-		return fmt.Errorf("conn closed")
-	}
-
-	if c.stopClient {
-		return fmt.Errorf("stopped")
-	}
-
-	if _, err := c.collection.UpdateOne(ctx, bson.M{"uuid": msg.Sender}, bson.M{"$unset": bson.M{fmt.Sprintf("sent.%s.%s", msg.Receiver, msg.MessageId): 1}}); err != nil {
-		return err
-	}
-
-	return nil
-
-}
-
-func (c *MongoClient) DelSentMsgForEvryone(ctx context.Context, msg model.MessageForDelete) error {
-
-	if c.closeClient {
-		return fmt.Errorf("conn closed")
-	}
-
-	if c.stopClient {
-		return fmt.Errorf("stopped")
-	}
-
-	deleteAtReceiver := mongo.NewUpdateOneModel()
-
-	deleteAtReceiver.SetFilter(bson.M{"uuid": msg.Receiver})
-	deleteAtReceiver.SetUpdate(bson.M{"$unset": bson.M{fmt.Sprintf("received.%s.%s", msg.Sender, msg.MessageId): 1}})
-
-	deleteAtSender := mongo.NewUpdateOneModel()
-
-	deleteAtSender.SetFilter(bson.M{"uuid": msg.Sender})
-	deleteAtSender.SetUpdate(bson.M{"$unset": bson.M{fmt.Sprintf("sent.%s.%s", msg.Receiver, msg.MessageId): 1}})
-
-	if _, err := c.collection.BulkWrite(ctx, []mongo.WriteModel{deleteAtReceiver, deleteAtSender}); err != nil {
-		return err
-	}
-
-	return nil
-}
-
-func (c *MongoClient) EditMessage(ctx context.Context, msg model.MessageForEdit) error {
-
-	if c.closeClient {
-		return fmt.Errorf("conn closed")
-	}
-
-	if c.stopClient {
-		return fmt.Errorf("stopped")
-	}
-
-	updateAtRecipient := mongo.NewUpdateOneModel()
-	updateAtRecipient.
-		SetFilter(bson.M{"uuid": msg.Recipient}).
-		SetUpdate(bson.M{"$set": bson.M{fmt.Sprintf("received.%s.%s.text", msg.Sender, msg.MessageId): msg.NewText}}).
-		SetUpdate(bson.M{"$set": bson.M{fmt.Sprintf("received.%s.%s.editFlag", msg.Sender, msg.MessageId): true}})
-
-	updateAtSender := mongo.NewUpdateOneModel()
-
-	updateAtSender.
-		SetFilter(bson.M{"uuid": msg.Sender}).
-		SetUpdate(bson.M{"$set": bson.M{fmt.Sprintf("sent.%s.%s.text", msg.Recipient, msg.MessageId): msg.NewText}}).
-		SetUpdate(bson.M{"$set": bson.M{fmt.Sprintf("sent.%s.%s.editFlag", msg.Recipient, msg.MessageId): true}})
-
-	if _, err := c.collection.BulkWrite(ctx, []mongo.WriteModel{updateAtRecipient, updateAtSender}); err != nil {
-		return err
-	}
-
-	return nil
-
-}
-
-func (c *MongoClient) InitUser(ctx context.Context, uuid string) error {
-
-	if _, err := c.collection.InsertOne(ctx, bson.M{"uuid": uuid, "sent": bson.M{}, "received": bson.M{}}); err != nil {
-		return err
-	}
-
-	return nil
+	return c.collections[name]
 
 }
