@@ -2,6 +2,7 @@ package chatrepository
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
 	mcl "github.com/LaughG33k/messageDBService/iternal/client/mongo"
@@ -91,6 +92,24 @@ func (c *ChatRepository) EditMessage(ctx context.Context, msg model.MessageForEd
 	}
 
 	return nil
+
+}
+
+func (c *ChatRepository) GetHistory(ctx context.Context, who string) (model.MessageHistory, error) {
+
+	var history model.MessageHistory
+
+	res := c.mongoClient.Collection(c.collection).FindOne(ctx, bson.M{"uuid": who})
+
+	if res.Err() != nil {
+		return history, res.Err()
+	}
+
+	if err := res.Decode(&history); err != nil {
+		return history, errors.New("failed to decode history")
+	}
+
+	return history, nil
 
 }
 
